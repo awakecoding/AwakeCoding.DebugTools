@@ -8,7 +8,7 @@
 RootModule = 'AwakeCoding.DebugTools.psm1'
 
 # Version number of this module.
-ModuleVersion = '2025.1.0'
+ModuleVersion = '2025.1.1'
 
 # Supported PSEditions
 CompatiblePSEditions = 'Desktop', 'Core'
@@ -67,6 +67,8 @@ CLRVersion = '4.0'
 # Functions to export from this module, for best performance, do not use wildcards and do not delete the entry, use an empty array if there are no functions to export.
 FunctionsToExport = @(
     'Start-LsaTlsKeyLog',
+    'Start-TlsKeyLogServer',
+    'Start-TlsKeyLogClient',
     'Install-WinDbg',
     'Install-DbgHelp'
     )

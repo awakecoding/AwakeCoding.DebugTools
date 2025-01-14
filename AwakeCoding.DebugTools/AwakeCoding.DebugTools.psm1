@@ -257,6 +257,362 @@ function Start-LsaTlsKeyLog {
     }
 }
 
+Add-Type -TypeDefinition @"
+using System;
+using System.IO;
+using System.Net;
+using System.Net.Sockets;
+using System.Collections.Generic;
+using System.Threading;
+
+public class FileTcpStreamer
+{
+    private TcpListener listener;
+    private List<TcpClient> clients;
+    private string filePath;
+    private FileStream fileStream;
+    private StreamReader reader;
+    private Thread acceptThread;
+    private Thread fileWatchThread;
+    private volatile bool running;
+
+    public FileTcpStreamer(string filePath, int port)
+    {
+        this.filePath = filePath;
+        this.listener = new TcpListener(IPAddress.Any, port);
+        this.clients = new List<TcpClient>();
+        this.running = false;
+    }
+
+    public void Start()
+    {
+        if (!File.Exists(filePath))
+            throw new FileNotFoundException($"File not found: {filePath}");
+
+        this.running = true;
+
+        // Start TCP listener
+        listener.Start();
+        Console.WriteLine($"Listening for connections on port {((IPEndPoint)listener.LocalEndpoint).Port}...");
+
+        // Start accepting clients
+        acceptThread = new Thread(AcceptClients);
+        acceptThread.IsBackground = true;
+        acceptThread.Start();
+
+        // Start watching the file
+        fileStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        reader = new StreamReader(fileStream);
+        reader.BaseStream.Seek(0, SeekOrigin.End); // Start at the end of the file
+
+        fileWatchThread = new Thread(WatchFile);
+        fileWatchThread.IsBackground = true;
+        fileWatchThread.Start();
+    }
+
+    private void AcceptClients()
+    {
+        while (running)
+        {
+            try
+            {
+                TcpClient client = listener.AcceptTcpClient();
+                lock (clients)
+                {
+                    clients.Add(client);
+                }
+                Console.WriteLine($"Client connected from {((IPEndPoint)client.Client.RemoteEndPoint).Address}");
+            }
+            catch (SocketException)
+            {
+                if (!running) break;
+            }
+        }
+    }
+
+    private void WatchFile()
+    {
+        while (running)
+        {
+            try
+            {
+                string line;
+                while ((line = reader.ReadLine()) != null)
+                {
+                    BroadcastLine(line);
+                }
+
+                Thread.Sleep(100);
+            }
+            catch (IOException ex)
+            {
+                Console.WriteLine($"File error: {ex.Message}");
+                break;
+            }
+        }
+    }
+
+    private void BroadcastLine(string line)
+    {
+        lock (clients)
+        {
+            for (int i = clients.Count - 1; i >= 0; i--)
+            {
+                TcpClient client = clients[i];
+                try
+                {
+                    StreamWriter writer = new StreamWriter(client.GetStream());
+                    writer.AutoFlush = true;
+                    writer.WriteLine(line);
+                }
+                catch (Exception)
+                {
+                    Console.WriteLine($"Client disconnected.");
+                    client.Close();
+                    clients.RemoveAt(i);
+                }
+            }
+        }
+    }
+
+    public void Stop()
+    {
+        Console.WriteLine("Stopping...");
+        running = false;
+
+        listener.Stop();
+
+        if (acceptThread != null && acceptThread.IsAlive)
+            acceptThread.Join();
+
+        if (fileWatchThread != null && fileWatchThread.IsAlive)
+            fileWatchThread.Join();
+
+        lock (clients)
+        {
+            foreach (var client in clients)
+            {
+                client.Close();
+            }
+            clients.Clear();
+        }
+
+        reader?.Close();
+        fileStream?.Close();
+
+        Console.WriteLine("Stopped.");
+    }
+}
+"@ -Language CSharp
+
+function Start-TlsKeyLogServer {
+    param (
+        [Parameter(Position = 0)]
+        [string] $LogFile,
+
+        [Parameter(Position = 1)]
+        [int] $Port = 12345,
+
+        [switch] $AllowInFirewall
+    )
+
+    if ([string]::IsNullOrEmpty($LogFile)) {
+        $WindowsTemp = Join-Path $Env:SystemRoot 'Temp'
+        $LogFile = Join-Path $WindowsTemp 'tls-lsa.log'
+    }
+
+    $LogFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($LogFile)
+
+    if ($AllowInFirewall) {
+        $DisplayName = "Allow TLS Key Log Server"
+        $CurrentRule = Get-NetFirewallRule -DisplayName $DisplayName -ErrorAction SilentlyContinue
+
+        if ($CurrentRule) {
+            $CurrentPorts = Get-NetFirewallPortFilter -AssociatedNetFirewallRule $CurrentRule |
+                Where-Object { $_.Protocol -eq "TCP" } | Select-Object -ExpandProperty LocalPort
+
+            if (-Not ($CurrentPorts -Contains $Port)) {
+                $CurrentRule | Remove-NetFirewallRule
+                $CurrentRule = $null
+            }
+        }
+
+        if ($null -eq $CurrentRule) {
+            Write-Host "Creating '$DisplayName' firewall rule for TCP port $Port"
+            New-NetFirewallRule -DisplayName $DisplayName -Direction Inbound -Protocol TCP -LocalPort $Port -Action Allow | Out-Null
+        }
+    }
+
+    Write-Host "Serving TLS key log '$LogFile' on TCP port $Port"
+
+    $streamer = New-Object FileTcpStreamer($LogFile, $Port)
+    $streamer.Start()
+
+    try {
+        Write-Host "Press any key to stop..."
+        [Console]::ReadLine() | Out-Null
+    } finally {
+        $streamer.Stop()
+    }
+}
+
+Add-Type -TypeDefinition @"
+using System;
+using System.IO;
+using System.Net.Sockets;
+using System.Threading;
+using System.Collections.Generic;
+
+public class TcpClientAggregator
+{
+    private List<string> servers;
+    private string outputFile;
+    private int retryInterval;
+    private volatile bool running;
+    private List<Thread> connectionThreads;
+
+    public TcpClientAggregator(string[] servers, string outputFile, int retryInterval)
+    {
+        this.servers = new List<string>(servers);
+        this.outputFile = outputFile;
+        this.retryInterval = retryInterval;
+        this.running = false;
+        this.connectionThreads = new List<Thread>();
+    }
+
+    public void Start()
+    {
+        if (servers.Count == 0)
+            throw new ArgumentException("No servers specified.");
+
+        if (string.IsNullOrEmpty(outputFile))
+            throw new ArgumentException("Output file must be specified.");
+
+        Directory.CreateDirectory(Path.GetDirectoryName(outputFile) ?? ".");
+        running = true;
+
+        foreach (var server in servers)
+        {
+            var thread = new Thread(() => ConnectToServer(server));
+            thread.IsBackground = true;
+            thread.Start();
+            connectionThreads.Add(thread);
+        }
+    }
+
+    private void ConnectToServer(string server)
+    {
+        string host;
+        int port = 12345; // Default port
+
+        var parts = server.Split(':');
+        if (parts.Length == 2 && int.TryParse(parts[1], out int parsedPort))
+        {
+            host = parts[0];
+            port = parsedPort;
+        }
+        else if (parts.Length == 1)
+        {
+            host = parts[0];
+        }
+        else
+        {
+            Console.WriteLine($"Invalid server address: {server}");
+            return;
+        }
+
+        while (running)
+        {
+            try
+            {
+                using (var client = new TcpClient())
+                {
+                    Console.WriteLine($"Connecting to {host}:{port}...");
+                    var connectTask = client.ConnectAsync(host, port);
+                    if (!connectTask.Wait(5000)) // Timeout for Connect
+                    {
+                        throw new TimeoutException($"Connection to {host}:{port} timed out.");
+                    }
+
+                    Console.WriteLine($"Connected to {host}:{port}.");
+
+                    using (var stream = client.GetStream())
+                    using (var reader = new StreamReader(stream))
+                    {
+                        while (running)
+                        {
+                            if (!stream.DataAvailable)
+                            {
+                                Thread.Sleep(100); // Avoid busy-waiting
+                                continue;
+                            }
+
+                            string line = reader.ReadLine();
+                            if (line != null)
+                            {
+                                File.AppendAllText(outputFile, $"{line}{Environment.NewLine}");
+                            }
+                            else
+                            {
+                                throw new IOException("Stream closed by server.");
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[{host}:{port}] Error: {ex.Message}");
+            }
+
+            if (running)
+            {
+                Console.WriteLine($"Retrying connection to {host}:{port} in {retryInterval} seconds...");
+                Thread.Sleep(retryInterval * 1000);
+            }
+        }
+    }
+
+    public void Stop()
+    {
+        Console.WriteLine("Stopping...");
+        running = false;
+
+        foreach (var thread in connectionThreads)
+        {
+            if (thread.IsAlive)
+                thread.Join();
+        }
+
+        Console.WriteLine("Stopped.");
+    }
+}
+"@ -Language CSharp
+
+function Start-TlsKeyLogClient {
+    param (
+        [Parameter(Mandatory=$true, Position=0)]
+        [string[]] $Servers,
+        [Parameter(Mandatory=$true, Position=1)]
+        [string] $LogFile,
+        [int] $RetryInterval = 10
+    )
+
+    $LogFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($LogFile)
+
+    Write-Host "Writing TLS key log to '$LogFile'"
+
+    $aggregator = [TcpClientAggregator]::new($Servers, $LogFile, $RetryInterval)
+    $aggregator.Start()
+
+    try {
+        Write-Host "Press any key to stop..."
+        [Console]::ReadLine() | Out-Null
+    } finally {
+        $aggregator.Stop()
+    }
+}
+
 function Install-WinDbg {
     param(
         [switch] $Start
