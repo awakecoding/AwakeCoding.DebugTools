@@ -38,6 +38,31 @@ function Start-LsaTlsKeyLog {
     try {
         Invoke-Command -Session $session -ScriptBlock {
 
+            function Test-SymbolExport {
+                [CmdletBinding()]
+                param (
+                    [Parameter(Mandatory, Position = 0)]
+                    [string] $Library,
+            
+                    [Parameter(Mandatory, Position = 1)]
+                    [string] $Symbol
+                )
+            
+                try {
+                    $lib = [System.Runtime.InteropServices.NativeLibrary]::Load($Library)
+                    try {
+                        $ptr = [IntPtr]::Zero
+                        return [System.Runtime.InteropServices.NativeLibrary]::TryGetExport($lib, $Symbol, [ref]$ptr)
+                    }
+                    finally {
+                        [System.Runtime.InteropServices.NativeLibrary]::Free($lib)
+                    }
+                }
+                catch {
+                    return $false
+                }
+            }
+
             Function Get-SecretKey {
                 param([Parameter(Mandatory)][IntPtr]$KeyPtr)
 
@@ -102,80 +127,6 @@ function Start-LsaTlsKeyLog {
 
                     $this.Invoke($SslProvider, $HandshakeHash, $InputBytes, $InputLength, $Flags)
                 }
-                New-PSDetourHook @ncrypt -MethodName SslExpandTrafficKeys -Action {
-                    <#
-                    .DESCRIPTION
-                    Called for TLS 1.3 sessions twice.
-                    First is for the handshake traffic key and second for the first
-                    handshake traffic secret.
-                    The function is undocumented but Param4 is the client secret and Param5
-                    is the server secret.
-                    #>
-                    [OutputType([int])]
-                    param (
-                        [IntPtr]$Param1,
-                        [IntPtr]$Param2,
-                        [IntPtr]$Param3,
-                        [IntPtr]$Param4,
-                        [IntPtr]$Param5
-                    )
-
-                    $res = $this.Invoke($Param1, $Param2, $Param3, $Param4, $Param5)
-
-                    $null = New-Item -Path Function:\Get-SecretKey -Value ([ScriptBlock]::Create(
-                            $this.State.GetSecretKeyFunc))
-                    $tid = [System.Threading.Thread]::CurrentThread.ManagedThreadId
-
-                    if ($this.State.Stages[$tid]) {
-                        $suffix = 'TRAFFIC_SECRET_0'
-                    }
-                    else {
-                        $suffix = 'HANDSHAKE_TRAFFIC_SECRET'
-                        $this.State.Stages[$tid] = $true
-                    }
-
-                    $clientSecret = Get-SecretKey -KeyPtr $Param4
-                    $serverSecret = Get-SecretKey -KeyPtr $Param5
-                    $cr = $this.State.ClientRandoms[$tid]
-
-                    ($this.State.TlsWriter).WriteLine('CLIENT_{0} {1} {2}', $suffix,
-                        [System.Convert]::ToHexString($cr),
-                        [System.Convert]::ToHexString($clientSecret))
-                    ($this.State.TlsWriter).WriteLine('SERVER_{0} {1} {2}', $suffix,
-                        [System.Convert]::ToHexString($cr),
-                        [System.Convert]::ToHexString($serverSecret))
-
-                    $res
-                }
-                New-PSDetourHook @ncrypt -MethodName SslExpandExporterMasterKey -Action {
-                    <#
-                    .DESCRIPTION
-                    Called for TLS 1.3 sessions.
-                    Gets the exporter secret through the undocumented function.
-                    #>
-                    [OutputType([int])]
-                    param (
-                        [IntPtr]$Param1,
-                        [IntPtr]$Param2,
-                        [IntPtr]$Param3,
-                        [IntPtr]$Param4
-                    )
-
-                    $res = $this.Invoke($Param1, $Param2, $Param3, $Param4)
-
-                    $null = New-Item -Path Function:\Get-SecretKey -Value ([ScriptBlock]::Create(
-                            $this.State.GetSecretKeyFunc))
-                    $tid = [System.Threading.Thread]::CurrentThread.ManagedThreadId
-
-                    $secret = Get-SecretKey -KeyPtr $Param4
-                    $cr = $this.State.ClientRandoms[$tid]
-
-                    ($this.State.TlsWriter).WriteLine('EXPORTER_SECRET {0} {1}',
-                        [System.Convert]::ToHexString($cr),
-                        [System.Convert]::ToHexString($secret))
-
-                    $res
-                }
                 New-PSDetourHook @ncrypt -MethodName SslGenerateSessionKeys -Action {
                     <#
                     .DESCRIPTION
@@ -239,6 +190,84 @@ function Start-LsaTlsKeyLog {
                         [System.Convert]::ToHexString($secret))
 
                     $this.Invoke($SslProvider, $MasterKey, $ReadKey, $WriteKey, $ParameterList, $Flags)
+                }
+                if (Test-SymbolExport 'ncrypt.dll' 'SslExpandTrafficKeys') {
+                    New-PSDetourHook @ncrypt -MethodName SslExpandTrafficKeys -Action {
+                        <#
+                        .DESCRIPTION
+                        Called for TLS 1.3 sessions twice.
+                        First is for the handshake traffic key and second for the first
+                        handshake traffic secret.
+                        The function is undocumented but Param4 is the client secret and Param5
+                        is the server secret.
+                        #>
+                        [OutputType([int])]
+                        param (
+                            [IntPtr]$Param1,
+                            [IntPtr]$Param2,
+                            [IntPtr]$Param3,
+                            [IntPtr]$Param4,
+                            [IntPtr]$Param5
+                        )
+
+                        $res = $this.Invoke($Param1, $Param2, $Param3, $Param4, $Param5)
+
+                        $null = New-Item -Path Function:\Get-SecretKey -Value ([ScriptBlock]::Create(
+                                $this.State.GetSecretKeyFunc))
+                        $tid = [System.Threading.Thread]::CurrentThread.ManagedThreadId
+
+                        if ($this.State.Stages[$tid]) {
+                            $suffix = 'TRAFFIC_SECRET_0'
+                        }
+                        else {
+                            $suffix = 'HANDSHAKE_TRAFFIC_SECRET'
+                            $this.State.Stages[$tid] = $true
+                        }
+
+                        $clientSecret = Get-SecretKey -KeyPtr $Param4
+                        $serverSecret = Get-SecretKey -KeyPtr $Param5
+                        $cr = $this.State.ClientRandoms[$tid]
+
+                        ($this.State.TlsWriter).WriteLine('CLIENT_{0} {1} {2}', $suffix,
+                            [System.Convert]::ToHexString($cr),
+                            [System.Convert]::ToHexString($clientSecret))
+                        ($this.State.TlsWriter).WriteLine('SERVER_{0} {1} {2}', $suffix,
+                            [System.Convert]::ToHexString($cr),
+                            [System.Convert]::ToHexString($serverSecret))
+
+                        $res
+                    }
+                }
+                if (Test-SymbolExport 'ncrypt.dll' 'SslExpandExporterMasterKey') {
+                    New-PSDetourHook @ncrypt -MethodName SslExpandExporterMasterKey -Action {
+                        <#
+                        .DESCRIPTION
+                        Called for TLS 1.3 sessions.
+                        Gets the exporter secret through the undocumented function.
+                        #>
+                        [OutputType([int])]
+                        param (
+                            [IntPtr]$Param1,
+                            [IntPtr]$Param2,
+                            [IntPtr]$Param3,
+                            [IntPtr]$Param4
+                        )
+
+                        $res = $this.Invoke($Param1, $Param2, $Param3, $Param4)
+
+                        $null = New-Item -Path Function:\Get-SecretKey -Value ([ScriptBlock]::Create(
+                                $this.State.GetSecretKeyFunc))
+                        $tid = [System.Threading.Thread]::CurrentThread.ManagedThreadId
+
+                        $secret = Get-SecretKey -KeyPtr $Param4
+                        $cr = $this.State.ClientRandoms[$tid]
+
+                        ($this.State.TlsWriter).WriteLine('EXPORTER_SECRET {0} {1}',
+                            [System.Convert]::ToHexString($cr),
+                            [System.Convert]::ToHexString($secret))
+
+                        $res
+                    }
                 }
             )
 
