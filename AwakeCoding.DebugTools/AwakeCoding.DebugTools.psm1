@@ -82,6 +82,10 @@ function Start-LsaTlsKeyLog {
             $tlsLog = [System.IO.File]::Open($using:LogFile, "Append", "Write", "Read")
             $tlsWriter = [System.IO.StreamWriter]::new($tlsLog)
             $tlsWriter.AutoFlush = $true
+            # StreamWriter is not thread-safe; detour hooks run on arbitrary lsass
+            # threads, so serialize writes to avoid racing its internal char buffer
+            # (which would otherwise emit embedded NUL bytes into the log).
+            $tlsWriter = [System.IO.TextWriter]::Synchronized($tlsWriter)
             $state = @{
                 GetSecretKeyFunc = ${function:Get-SecretKey}.ToString()
                 ClientRandoms    = [Hashtable]::Synchronized(@{})
