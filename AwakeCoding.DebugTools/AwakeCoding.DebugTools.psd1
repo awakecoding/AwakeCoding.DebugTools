@@ -8,7 +8,7 @@
 RootModule = 'AwakeCoding.DebugTools.psm1'
 
 # Version number of this module.
-ModuleVersion = '2025.1.2'
+ModuleVersion = '2026.2.0'
 
 # Supported PSEditions
 CompatiblePSEditions = 'Desktop', 'Core'
